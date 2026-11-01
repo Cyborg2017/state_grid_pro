@@ -1,12 +1,17 @@
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, CoreState, EVENT_HOMEASSISTANT_STARTED
 from homeassistant.const import Platform
 from homeassistant.components.webhook import (
     async_register as webhook_register,
     async_unregister as webhook_unregister,
 )
+from homeassistant.components.http import StaticPathConfig
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.helpers.event import async_call_later
 from aiohttp import web
+import json
 import secrets
+from pathlib import Path
 from .const import DOMAIN
 from .utils.logger import LOGGER
 from .utils.store import async_load_from_store
@@ -15,6 +20,92 @@ from .config_flow import StateGridConfigFlow
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 CONF_PUSH_WEBHOOK = "push_webhook_id"
+
+# ─── 前端 Lovelace 卡片注册 ───
+URL_BASE = "/state_grid-local"
+CARD_FILENAME = "state_grid-card.js"
+MANIFEST_PATH = Path(__file__).parent / "manifest.json"
+try:
+    with open(MANIFEST_PATH, encoding="utf-8") as f:
+        INTEGRATION_VERSION = json.load(f).get("version", "0.0.0")
+except Exception:
+    INTEGRATION_VERSION = "0.0.0"
+
+# 确保静态路径只注册一次
+_STATIC_REGISTERED = False
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """组件初始化时注册前端卡片资源."""
+    await _register_static_and_js(hass)
+
+    # HA 启动后追加 Lovelace storage 注册（持久化，防刷新丢失）
+    async def _register_lovelace_storage(_event=None) -> None:
+        await _register_lovelace_resource(hass)
+
+    if hass.state == CoreState.running:
+        await _register_lovelace_storage()
+    else:
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_lovelace_storage)
+
+    return True
+
+
+async def _register_static_and_js(hass: HomeAssistant) -> None:
+    """立即注册静态路径和 add_extra_js_url（首次加载必需）."""
+    global _STATIC_REGISTERED
+    if _STATIC_REGISTERED:
+        return
+    _STATIC_REGISTERED = True
+
+    try:
+        await hass.http.async_register_static_paths([
+            StaticPathConfig(URL_BASE, str(Path(__file__).parent / "www"), False)
+        ])
+    except RuntimeError:
+        LOGGER.debug("静态路径已注册: %s", URL_BASE)
+
+    add_extra_js_url(hass, f"{URL_BASE}/{CARD_FILENAME}")
+    LOGGER.debug("注册前端卡片: %s/%s", URL_BASE, CARD_FILENAME)
+
+
+async def _register_lovelace_resource(hass: HomeAssistant) -> None:
+    """通过 Lovelace storage API 持久化注册资源（防刷新丢失）."""
+    lovelace = hass.data.get("lovelace")
+    if not lovelace or not hasattr(lovelace, "resources") or lovelace.resources is None:
+        return
+
+    url = f"{URL_BASE}/{CARD_FILENAME}?v={INTEGRATION_VERSION}"
+    url_base_no_version = f"{URL_BASE}/{CARD_FILENAME}"
+
+    async def _check_and_register(_now=None) -> None:
+        try:
+            if not lovelace.resources.loaded:
+                LOGGER.debug("Lovelace 资源未加载，3秒后重试")
+                async_call_later(hass, 3, _check_and_register)
+                return
+
+            existing = [r for r in lovelace.resources.async_items() if r["url"].startswith(URL_BASE)]
+
+            for resource in existing:
+                resource_path = resource["url"].split("?")[0]
+                if resource_path == url_base_no_version:
+                    if resource["url"] != url:
+                        LOGGER.info("更新卡片资源版本: %s -> %s", resource["url"], url)
+                        await lovelace.resources.async_update_item(
+                            resource["id"],
+                            {"res_type": "module", "url": url},
+                        )
+                    return
+
+            LOGGER.info("持久化注册前端卡片: %s", url)
+            await lovelace.resources.async_create_item(
+                {"res_type": "module", "url": url}
+            )
+        except Exception as ex:
+            LOGGER.debug("Lovelace 资源注册失败: %s", ex)
+
+    await _check_and_register()
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
